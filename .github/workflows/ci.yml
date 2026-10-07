@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [ 'main', 'develop' ]
+  pull_request:
+    branches: [ 'main', 'develop' ]
+  workflow_dispatch:
+    inputs:
+      testTag:
+        description: 'Tag (o expresión de tags) de Cucumber a ejecutar. Ej: @GH-3, @HU-04, @negativo, "@HU-05 and @positivo". Vacío = toda la suite (@botica).'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      JAVA_VERSION: '21'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-jdk-${{ env.JAVA_VERSION }}-${{ hashFiles('**/build.gradle','**/settings.gradle','**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-jdk-${{ env.JAVA_VERSION }}-
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Run Serenity tests (with tag support)
+        env:
+          INPUT_TAG: ${{ github.event.inputs.testTag }}
+        run: |
+          # En ejecución manual se usa el input; si viene vacío (o en push/PR) se corre toda la suite
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            tag='@botica'
+          fi
+          # Si es un único tag sin @, se le agrega
+          if [ "${tag#@}" = "$tag" ] && ! echo "$tag" | grep -q ' '; then
+            tag="@$tag"
+          fi
+          echo "Using Cucumber tags: '$tag'"
+          ./gradlew clean test --no-daemon --console=plain -Dcucumber.filter.tags="$tag"
+
+      - name: Upload Serenity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serenity-report
+          path: target/site/serenity
+
+      - name: Upload Cucumber JSON and test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            target/cucumber-reports
+            build/test-results/test
+
+      - name: Actualizar Issues vinculados a los escenarios (@GH-n)
+        if: always() && github.event_name != 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const dir = 'target/cucumber-reports';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const inputTag = (context.payload.inputs && context.payload.inputs.testTag) || '';
+
+            if (!fs.existsSync(dir)) {
+              core.warning('No existe target/cucumber-reports: no hay resultados para reportar.');
+              return;
+            }
+
+            // 1. Leer los reportes Cucumber JSON y agrupar los resultados por issue (@GH-n o @Issue-n)
+            const porIssue = {};
+            for (const file of fs.readdirSync(dir).filter(f => f.endsWith('.json'))) {
+              const features = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
+              for (const feature of features) {
+                for (const el of feature.elements || []) {
+                  if (el.type === 'background') continue;
+                  const tags = (el.tags || []).map(t => t.name);
+                  const ids = tags.map(t => (t.match(/^@(?:GH|Issue)-(\d+)$/i) || [])[1]).filter(Boolean);
+                  const steps = [...(el.before || []), ...(el.steps || []), ...(el.after || [])];
+                  for (const s of el.steps || []) for (const a of s.after || []) steps.push(a);
+                  const fallo = steps.find(s => s.result && s.result.status === 'failed');
+                  for (const id of ids) {
+                    porIssue[id] = porIssue[id] || { nombre: el.name, feature: feature.uri, pasados: 0, fallidos: [] };
+                    if (fallo) {
+                      porIssue[id].fallidos.push({ nombre: el.name, error: (fallo.result.error_message || '').split('\n').slice(0, 6).join('\n') });
+                    } else {
+                      porIssue[id].pasados++;
+                    }
+                  }
+                }
+              }
+            }
+
+            // Si se pidió un @GH-n concreto y no se ejecutó nada, también se informa en el issue
+            const pedido = (inputTag.match(/^@?(?:GH|Issue)-(\d+)$/i) || [])[1];
+            if (pedido && !porIssue[pedido]) {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: Number(pedido),
+                body: `### ⚠️ Sin ejecuciones\nEl tag \`${inputTag}\` no seleccionó ningún escenario.\n\n🔗 [Ver ejecución](${runUrl})` });
+            }
+
+            // 2. Comentar el resultado en cada issue y actualizar sus labels
+            const resumen = [['Issue', 'Escenario', 'Resultado', 'Ejecuciones']];
+            for (const [id, r] of Object.entries(porIssue)) {
+              const ok = r.fallidos.length === 0;
+              const total = r.pasados + r.fallidos.length;
+              let body = `### ${ok ? '✅ PASSED' : '❌ FAILED'} — ejecución automatizada (Serenity BDD)\n\n`
+                + `| Campo | Valor |\n|---|---|\n`
+                + `| Escenario | ${r.nombre} |\n`
+                + `| Feature | \`${r.feature}\` |\n`
+                + `| Ejecuciones (Examples) | ${r.pasados}/${total} aprobadas |\n`
+                + `| Disparado por | \`${context.eventName}\`${inputTag ? ` con tag \`${inputTag}\`` : ''} |\n`
+                + `| Commit | ${context.sha.substring(0, 7)} |\n\n`
+                + `🔗 [Ver ejecución del pipeline y reporte Serenity](${runUrl})\n`;
+              if (!ok) {
+                body += `\n<details><summary>Detalle de fallos</summary>\n\n`
+                  + r.fallidos.map(f => `**${f.nombre}**\n\`\`\`\n${f.error}\n\`\`\``).join('\n\n')
+                  + `\n</details>\n`;
+              }
+              const issue_number = Number(id);
+              try {
+                await github.rest.issues.createComment({ ...context.repo, issue_number, body });
+                const quitar = ok ? ['automated-failed', 'bug'] : ['automated-passed'];
+                for (const name of quitar) {
+                  try { await github.rest.issues.removeLabel({ ...context.repo, issue_number, name }); } catch (e) { /* no lo tenía */ }
+                }
+                await github.rest.issues.addLabels({ ...context.repo, issue_number,
+                  labels: ok ? ['automated-passed'] : ['automated-failed', 'bug'] });
+              } catch (e) {
+                core.warning(`No se pudo actualizar el issue #${id}: ${e.message}`);
+              }
+              resumen.push([`#${id}`, r.nombre, ok ? '✅ PASSED' : '❌ FAILED', `${r.pasados}/${total}`]);
+            }
+
+            await core.summary.addHeading('Trazabilidad escenarios ↔ Issues').addTable(resumen).write();
